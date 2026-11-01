@@ -6,3 +6,6 @@ deep-translator==1.11.4
 feedparser==6.0.10
 requests==2.31.0
 schedule==1.2.1
+pandas==2.2.1
+pytz==2024.1
+streamlit-autorefresh==1.0.1
