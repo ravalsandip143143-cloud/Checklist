@@ -14,6 +14,9 @@ from streamlit_autorefresh import st_autorefresh
 from email.utils import parsedate_to_datetime
 import yfinance as yf
 
+# Newline helper (Zero-backslash safe for cloud & file transfer)
+NL = chr(10)
+
 # =====================================================================
 # [SECTION 0] : PAGE CONFIG & BOLD BLACK TEXT / ZERO-GREY UI STYLING
 # P1 & P2 Fixed:
@@ -308,8 +311,7 @@ def angel_auto_login(force_relogin=False, notify_telegram=True):
 
         if notify_telegram:
             send_telegram_alert(
-                f"✅ <b>S'Ravaal Option Alert:</b> Angel One Permanent Auto-Login ACTIVE!
-"
+                f"✅ <b>S'Ravaal Option Alert:</b> Angel One Permanent Auto-Login ACTIVE!{NL}"
                 f"🕒 <b>Login Time:</b> {now_str} (Connected till 4:00 PM Sleep Mode)"
             )
         return True
@@ -391,21 +393,19 @@ def check_market_news(is_morning_activation=False):
                     else "🚨 <b>S'RAVAAL HIGH IMPACT NEWS</b> 🚨"
                 )
 
-                msg = f"{header_tag}
-
-"
-                msg += f"⏰ <b>News Time:</b> {pub_time_str}
-"
-                msg += f"🎯 <b>Matched Tag:</b> {tag_str}
-
-"
-                msg += f"🇮🇳 <b>Gujarati:</b> {title_gu}
-
-"
-                msg += f"🔤 <b>English:</b> {title_en}
-
-"
-                msg += f"⚡ <b>Action:</b> Nifty 50 Option Radar"
+                msg_lines = [
+                    header_tag,
+                    "",
+                    f"⏰ <b>News Time:</b> {pub_time_str}",
+                    f"🎯 <b>Matched Tag:</b> {tag_str}",
+                    "",
+                    f"🇮🇳 <b>Gujarati:</b> {title_gu}",
+                    "",
+                    f"🔤 <b>English:</b> {title_en}",
+                    "",
+                    "⚡ <b>Action:</b> Nifty 50 Option Radar"
+                ]
+                msg = NL.join(msg_lines)
                 
                 if send_telegram_alert(msg):
                     seen_news_Global.add(title_en)
@@ -593,7 +593,6 @@ def generate_checklist_data():
 
     # 1. Gift Nifty / Nifty Futures (NSE:NIFTY1! / SGX:IN1!)
     prev_gn, stat_gn, chg_gn, pct_gn = get_quote_smart(tv_quotes, ["NSE:NIFTY1!", "SGX:IN1!"], "^NSEI", decimals=1)
-    # Also compute gap vs Nifty Spot if both available
     sig_gn = classify_signal(pct_gn, invert=False, flat_threshold=0.05)
     rows.append({
         "Category": "🇮🇳 India Index",
@@ -738,7 +737,6 @@ def generate_checklist_data():
         fii_str = f"{'+' if fii_net >= 0 else ''}{fii_net:,.0f} Cr ({'Net Buy' if fii_net >= 0 else 'Net Sell'})"
         fii_sig = "🟢 Bullish" if fii_net >= 0 else "🔴 Bearish"
     else:
-        # Derive institutional flow proxy from Nifty + DXY + US10Y when NSE blocks cloud IP
         fii_bias_bull = (pct_gn >= 0 and pct_nf >= 0)
         fii_str = "Live Flow: Buying Support" if fii_bias_bull else "Live Flow: Selling Pressure"
         fii_sig = "🟢 Bullish" if fii_bias_bull else "🔴 Bearish"
@@ -766,7 +764,6 @@ def generate_checklist_data():
     })
 
     # 17 & 18. FII Derivatives (Futures & Options Trend aligned with live Nifty1! vs Spot)
-    fut_spread = chg_gn - chg_nf
     fut_bull = (pct_gn >= 0)
     rows.append({
         "Category": "🏦 FII Derivatives",
@@ -885,28 +882,28 @@ def run_pre_market_checklist():
     df = generate_checklist_data()
     pos, neu, bear, total = calculate_checklist_score(df)
     
-    msg = "🌅 <b>S'RAVAAL LIVE PRE-MARKET CHECKLIST</b> 🌅
-
-<pre>"
-    msg += f"{'Indicator':<18} | {'Prev':<8} | {'Live Status':<16} | {'Sig'}
-"
-    msg += "-" * 56 + "
-"
+    table_lines = [
+        "🌅 <b>S'RAVAAL LIVE PRE-MARKET CHECKLIST</b> 🌅",
+        "",
+        "<pre>",
+        f"{'Indicator':<18} | {'Prev':<8} | {'Live Status':<16} | {'Sig'}",
+        "-" * 56
+    ]
     for _, row in df.iterrows():
         ind = str(row['Indicator'])[:17]
         prv = str(row['Prev Close'])[:8] if row['Prev Close'] else "-"
         val = str(row['Status / Value']).split("(")[0].strip()[:15]
         sig = str(row['Signal']).split()[0]
-        msg += f"{ind:<18} | {prv:<8} | {val:<16} | {sig}
-"
-    msg += "</pre>
-
-"
-    bias_text = "BULLISH BIAS 📈" if pos > bear else ("BEARISH BIAS 📉" if bear > pos else "SIDEWAYS / CAUTIOUS ⚖️")
-    msg += f"📊 <b>POSITIVE SCORE: {pos} / {total} Bullish</b> (🟢 {pos} | ⚪ {neu} | 🔴 {bear})
-"
-    msg += f"⚡ <b>Nifty Option View:</b> {bias_text}"
+        table_lines.append(f"{ind:<18} | {prv:<8} | {val:<16} | {sig}")
     
+    bias_text = "BULLISH BIAS 📈" if pos > bear else ("BEARISH BIAS 📉" if bear > pos else "SIDEWAYS / CAUTIOUS ⚖️")
+    table_lines.extend([
+        "</pre>",
+        "",
+        f"📊 <b>POSITIVE SCORE: {pos} / {total} Bullish</b> (🟢 {pos} | ⚪ {neu} | 🔴 {bear})",
+        f"⚡ <b>Nifty Option View:</b> {bias_text}"
+    ])
+    msg = NL.join(table_lines)
     send_telegram_alert(msg)
 
 # =====================================================================
@@ -981,7 +978,7 @@ if st.session_state.system_active_mode and is_working_hours():
         threading.Thread(target=check_market_news, kwargs={"is_morning_activation": True}, daemon=True).start()
 
 with st.sidebar:
-    st.markdown('<div class="box-style">⚙️ S'Ravaal Control Center</div>', unsafe_allow_html=True)
+    st.markdown("""<div class="box-style">⚙️ S'Ravaal Control Center</div>""", unsafe_allow_html=True)
     
     st.session_state.auto_mode_enabled = st.toggle(
         "🤖 Automatic Engine (Auto News + Score)", 
@@ -1042,7 +1039,7 @@ if within_time and st.session_state.system_active_mode:
     st_autorefresh(interval=120 * 1000, key="sravl_2min_refresh")
 
 # Main Dashboard Header
-st.markdown('<div class="header-style">🚀 S'Ravaal option Alert Dashboard</div>', unsafe_allow_html=True)
+st.markdown("""<div class="header-style">🚀 S'Ravaal option Alert Dashboard</div>""", unsafe_allow_html=True)
 
 # Top Time & Morning Wake-Up Bar (Bold Black Text inside Status Boxes)
 t_col1, t_col2, t_col3 = st.columns(3)
