@@ -13,6 +13,10 @@ import pytz
 from streamlit_autorefresh import st_autorefresh
 from email.utils import parsedate_to_datetime
 import yfinance as yf
+import json
+import os
+import re
+import hashlib
 
 # Newline helper (Zero-backslash safe for cloud & file transfer)
 NL = chr(10)
@@ -195,10 +199,12 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =====================================================================
-# [SECTION 1] : CONFIGURATION, SECRETS & IST TIMEZONE
+# [SECTION 1] : CONFIGURATION, SECRETS, SINGLETON CACHE & STRICT FILTERS
+# Fixed: Shared @st.cache_resource state prevents duplicate threads & alerts
 # =====================================================================
 
 IST = pytz.timezone('Asia/Kolkata')
+ALERT_CACHE_FILE = "sravl_sent_alerts_cache.json"
 
 def get_secret(key_name, default_val):
     try:
@@ -213,32 +219,162 @@ ANGEL_CLIENT_ID = get_secret("ANGEL_CLIENT_ID", "YOUR_ANGEL_CLIENT_ID_HERE")
 ANGEL_PIN = get_secret("ANGEL_PIN", "YOUR_ANGEL_PIN_HERE")
 ANGEL_TOTP_SECRET = get_secret("ANGEL_TOTP_SECRET", "YOUR_ANGEL_TOTP_SECRET_HERE")
 
-# Strict Combined Whitelist (Nifty 50, BankNifty, Nifty IT, Top 10 Heavyweights & Macro)
+# ---------------------------------------------------------------------
+# STRICT OPTION-TRADING NEWS FILTER (ONLY YOUR 6 APPROVED CATEGORIES)
+# ---------------------------------------------------------------------
+# 1. Option related only
+# 2. Nifty, BankNifty, Sensex high-impact macro/policy news
+# 3. India Top 10 Heavyweight Stocks
+# 4. War, Crude Oil, Brent Oil, USD vs INR, Gold
+# 5. Closing / Opening market recaps -> FULLY IGNORED (NEWS_BLACKLIST)
+# 6. Heavy option movement catalysts (RBI, Fed, SEBI F&O, STT, Inflation, Earnings/Scam)
+
 NEWS_WHITELIST = [
-    # Indices
-    "nifty", "nifty 50", "bank nifty", "banknifty", "nifty it", "nifty metal", "sensex", "gift nifty",
-    # Top 10 Heavyweight Stocks
-    "reliance", "hdfc bank", "hdfc", "icici bank", "icici", "infosys", "infy", 
-    "tcs", "itc", "l&t", "larsen", "bharti airtel", "airtel", "sbi", "state bank", "kotak",
-    # Global & Macro Triggers
-    "trump", "crude", "brent", "usd inr", "rupee", "dollar index", "dxy", "bond yield",
-    "rbi", "fed", "repo rate", "rate cut", "powell", "malhotra", "das", "mpc", "tariff",
-    # High Impact Events / Scams / Results
-    "scam", "fraud", "sebi", "hindenburg", "default", "advisory", 
-    "q1", "q2", "q3", "q4", "earnings", "results", "fii", "dii"
+    # [1] Option Trading & Derivatives Specific
+    "option chain", "options trading", "nifty options", "bank nifty options",
+    "open interest", "put-call", "pcr", "call writing", "put writing",
+    "short covering", "long unwinding", "india vix", "vix", "expiry",
+    "gamma", "straddle", "f&o", "derivatives", "sebi f&o", "lot size", "margin rule",
+
+    # [2] Nifty / BankNifty / Sensex High-Impact Triggers
+    "nifty", "nifty 50", "bank nifty", "banknifty", "sensex", "gift nifty",
+
+    # [3] India Top 10 Heavyweight Stocks
+    "reliance industries", "reliance", "hdfc bank", "icici bank",
+    "infosys", "tcs", "tata consultancy", "bharti airtel", "airtel",
+    "itc", "l&t", "larsen & toubro", "sbi", "state bank of india",
+    "kotak mahindra", "kotak bank", "axis bank", "bajaj finance",
+
+    # [4] War, Crude Oil, Brent Oil, USD vs INR, Gold
+    "war", "missile", "airstrike", "ceasefire", "geopolitical", "middle east",
+    "israel", "iran", "russia", "ukraine", "tariff", "trade war", "trump",
+    "crude oil", "brent crude", "brent oil", "opec",
+    "usd inr", "usd/inr", "rupee", "dollar index", "dxy",
+    "gold price", "gold rate", "gold hits", "gold jumps", "gold falls", "gold surges", "gold crashes", "xauusd",
+
+    # [6] Heavy Option Movement Catalysts (Policy, Rates, Macro Shock, Scams, Results)
+    "rbi", "repo rate", "mpc", "rate cut", "rate hike", "crr",
+    "us fed", "federal reserve", "fomc", "powell", "us cpi", "inflation",
+    "gdp", "us 10-year", "bond yield", "fii", "dii",
+    "sebi", "stt", "budget", "finance ministry", "circuit",
+    "scam", "fraud", "hindenburg", "default", "penalty", "ban", "block deal",
+    "q1 result", "q2 result", "q3 result", "q4 result", "quarterly results", "earnings"
 ]
 
-if 'seen_news_titles' not in st.session_state:
-    st.session_state.seen_news_titles = set()
-seen_news_Global = set()
+# [5] STRICT BLACKLIST: Opening / Closing / Routine Market Recap Messages FULLY IGNORED
+NEWS_BLACKLIST = [
+    # Routine Opening & Closing Bell Recaps
+    "taking stock", "closing bell", "opening bell", "bell to bell",
+    "market wrap", "weekly wrap", "daily wrap", "market recap", "market highlights",
+    "market close", "market closes", "market closed", "markets close", "markets end",
+    "market ends", "market ended", "ends higher", "ends lower", "ends flat",
+    "ended higher", "ended lower", "ended flat", "ended at",
+    "closes higher", "closes lower", "closes flat", "closes above", "closes below", "closes at",
+    "closed higher", "closed lower", "closed above", "closed below", "closed at",
+    "settles higher", "settles lower", "settles at", "settled at", "finishes higher", "finishes lower",
+    "opens higher", "opens lower", "opens flat", "opened higher", "opened lower", "opened flat",
+    "flat start", "muted start", "weak start", "strong start", "positive start", "negative start",
+    "early trade", "morning trade", "afternoon trade", "midday", "mid-day", "opening trade", "closing trade",
+    "at close", "at open", "pre-market", "post-market",
+    # Routine Sensex / Nifty / BankNifty Point Movement Recaps (Not Real Catalysts)
+    "sensex jumps", "sensex surges", "sensex rallies", "sensex rises", "sensex gains", "sensex adds",
+    "sensex climbs", "sensex zooms", "sensex falls", "sensex drops", "sensex slips", "sensex sheds",
+    "sensex tanks", "sensex tumbles", "sensex plunges", "sensex ends", "sensex closes", "sensex opens",
+    "sensex hits", "sensex today", "nifty today", "bank nifty today",
+    "nifty jumps", "nifty surges", "nifty rallies", "nifty rises", "nifty gains", "nifty climbs",
+    "nifty falls", "nifty drops", "nifty slips", "nifty sheds", "nifty tanks", "nifty ends",
+    "nifty closes", "nifty opens", "nifty settles", "nifty above", "nifty below", "nifty crosses",
+    "nifty reclaims", "nifty breaches", "nifty snaps", "bounces back", "rebounds",
+    "winning streak", "losing streak", "day high", "day low",
+    # Noise / Clickbait / Non-Option Filler
+    "stock market today", "share market live", "market live updates", "live updates",
+    "trade setup", "stocks to watch", "stocks in focus", "buzzing stocks",
+    "top gainers", "top losers", "brokerage calls", "buy or sell", "should you buy",
+    "target price", "multibagger", "penny stock", "ipo", "gmp", "allotment",
+    "mutual fund", "sip", "podcast", "here is why", "heres why", "explained",
+    "dalal street", "what to expect", "key levels to watch", "gift nifty indicates"
+]
 
-ANGEL_SESSION_STATE = {
-    "is_logged_in": False,
-    "last_login_time": None,
-    "totp_used": None,
-    "session_obj": None,
-    "morning_news_sent_date": None
-}
+# Impact action words required when headline only mentions Nifty/BankNifty/Sensex
+HIGH_IMPACT_CATALYST_WORDS = [
+    "option", "options", "open interest", "pcr", "vix", "expiry", "f&o", "derivatives",
+    "sebi", "rbi", "repo", "mpc", "fed", "fomc", "powell", "rate cut", "rate hike",
+    "inflation", "cpi", "gdp", "stt", "tax", "budget", "margin", "lot size", "circular",
+    "war", "missile", "strike", "ceasefire", "tariff", "trump", "sanction", "opec",
+    "crude", "brent", "rupee", "usd", "dollar", "dxy", "gold", "bond yield",
+    "fii", "dii", "scam", "fraud", "ban", "default", "penalty", "investigation",
+    "q1", "q2", "q3", "q4", "results", "earnings", "profit", "revenue", "dividend",
+    "merger", "demerger", "acquisition", "block deal", "order win", "downgrade", "upgrade",
+    "circuit", "crash", "halt", "emergency", "policy", "advisory", "record low", "record high"
+]
+
+def _load_disk_cache():
+    if os.path.exists(ALERT_CACHE_FILE):
+        try:
+            with open(ALERT_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {
+                    "sent_hashes": set(data.get("sent_hashes", [])),
+                    "sent_wordsets": [set(ws) for ws in data.get("sent_wordsets", [])[-250:]],
+                    "vix_date": data.get("vix_date", ""),
+                    "vix_alerted_milestones": set(data.get("vix_alerted_milestones", [])),
+                    "last_vix_alert_ts": float(data.get("last_vix_alert_ts", 0.0)),
+                    "morning_news_sent_date": data.get("morning_news_sent_date", None)
+                }
+        except Exception as e:
+            logger.warning(f"Cache load note: {e}")
+    return {
+        "sent_hashes": set(),
+        "sent_wordsets": [],
+        "vix_date": "",
+        "vix_alerted_milestones": set(),
+        "last_vix_alert_ts": 0.0,
+        "morning_news_sent_date": None
+    }
+
+def _save_disk_cache(shared):
+    try:
+        payload = {
+            "sent_hashes": list(shared["sent_hashes"])[-500:],
+            "sent_wordsets": [list(ws) for ws in shared["sent_wordsets"][-250:]],
+            "vix_date": shared["vix_date"],
+            "vix_alerted_milestones": list(shared["vix_alerted_milestones"]),
+            "last_vix_alert_ts": shared["last_vix_alert_ts"],
+            "morning_news_sent_date": shared["angel_state"]["morning_news_sent_date"]
+        }
+        with open(ALERT_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception as e:
+        logger.warning(f"Cache save note: {e}")
+
+@st.cache_resource
+def get_shared_engine_state():
+    """
+    GLOBAL SINGLETON across ALL browser tabs & 2-min refreshes!
+    Guarantees 100% zero duplicate threads, zero duplicate news & zero VIX spam.
+    """
+    disk = _load_disk_cache()
+    return {
+        "lock": threading.Lock(),
+        "scheduler_started": False,
+        "sent_hashes": disk["sent_hashes"],
+        "sent_wordsets": disk["sent_wordsets"],
+        "vix_date": disk["vix_date"],
+        "vix_alerted_milestones": disk["vix_alerted_milestones"],
+        "last_vix_alert_ts": disk["last_vix_alert_ts"],
+        "auto_engine": {"enabled": True},
+        "angel_state": {
+            "is_logged_in": False,
+            "last_login_time": None,
+            "totp_used": None,
+            "session_obj": None,
+            "morning_news_sent_date": disk["morning_news_sent_date"]
+        }
+    }
+
+SHARED = get_shared_engine_state()
+ANGEL_SESSION_STATE = SHARED["angel_state"]
+AUTO_ENGINE_STATE = SHARED["auto_engine"]
 
 # =====================================================================
 # [SECTION 1.5] : WORKING HOURS CHECK (7:00 AM to 4:00 PM IST)
@@ -331,8 +467,7 @@ def ensure_angel_permanent_session():
             logger.info("4:00 PM Sleep Mode reached: Angel One Session safely parked.")
 
 # =====================================================================
-# [SECTION 4] : NEWS ENGINE (7:30 AM AUTO & PREV DAY 4:00 PM CUTOFF)
-# Fetches all news after Previous Day 4:00 PM IST on morning wake-up
+# [SECTION 4] : NEWS ENGINE (STRICT 6-POINT FILTER + ZERO DUPLICATES)
 # =====================================================================
 
 def get_yesterday_4pm_ist():
@@ -341,31 +476,95 @@ def get_yesterday_4pm_ist():
     yesterday = now_ist - timedelta(days=1)
     return yesterday.replace(hour=16, minute=0, second=0, microsecond=0)
 
+def _clean_headline_for_dedup(title_en):
+    """Strips publisher suffix (e.g., ' - Moneycontrol') and normalizes words"""
+    base = title_en.rsplit(" - ", 1)[0].strip().lower()
+    cleaned = re.sub(r"[^a-z0-9 ]+", " ", base)
+    cleaned = re.sub(r" +", " ", cleaned).strip()
+    stop_words = {"the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "as", "is", "are", "with", "from", "by", "over", "after", "amid", "says", "report"}
+    wordset = {w for w in cleaned.split() if len(w) > 2 and w not in stop_words}
+    h = hashlib.md5(cleaned.encode("utf-8")).hexdigest()
+    return h, wordset
+
+def _is_duplicate_news(title_en):
+    """Checks exact normalized hash AND 65%+ similar headline across different sites"""
+    h, wordset = _clean_headline_for_dedup(title_en)
+    if h in SHARED["sent_hashes"]:
+        return True, h, wordset
+    if len(wordset) >= 3:
+        for prev_ws in SHARED["sent_wordsets"]:
+            if not prev_ws:
+                continue
+            overlap = len(wordset & prev_ws) / float(min(len(wordset), len(prev_ws)))
+            if overlap >= 0.65:
+                return True, h, wordset
+    return False, h, wordset
+
+WB = chr(92) + "b"
+
+def _has_exact_term(text_lower, term):
+    return re.search(WB + re.escape(term) + WB, text_lower) is not None
+
+def is_high_impact_option_news(title_en):
+    """
+    Strictly enforces all 6 user news rules:
+    - Immediately REJECTS closing/opening/recap fluff (Point 5)
+    - Accepts ONLY Option/Nifty/BankNifty/Sensex impact, Top 10 Heavyweights,
+      War/Crude/Brent/USD-INR/Gold, and heavy movement catalysts (Points 1-4, 6)
+    """
+    base_lower = title_en.rsplit(" - ", 1)[0].lower()
+
+    # Step 1: Strictly IGNORE closing/opening/recap/filler news (Point 5)
+    for blocked in NEWS_BLACKLIST:
+        if _has_exact_term(base_lower, blocked):
+            return False, []
+
+    # Step 2: Check approved whitelist match with exact word boundaries (Points 1, 2, 3, 4, 6)
+    matched = [kw.upper() for kw in NEWS_WHITELIST if _has_exact_term(base_lower, kw)]
+    if not matched:
+        return False, []
+
+    # Step 3: Extra strictness -> If headline mentions only index names (Nifty/Sensex/BankNifty)
+    # WITHOUT any real catalyst/option/stock/macro trigger, reject it as noise!
+    only_index_tags = {"NIFTY", "NIFTY 50", "BANK NIFTY", "BANKNIFTY", "SENSEX", "GIFT NIFTY"}
+    if set(matched).issubset(only_index_tags):
+        has_catalyst = any(_has_exact_term(base_lower, cw) for cw in HIGH_IMPACT_CATALYST_WORDS)
+        if not has_catalyst:
+            return False, []
+
+    return True, list(dict.fromkeys(matched))[:3]
+
 def check_market_news(is_morning_activation=False):
-    """News scraper with Yesterday 4:00 PM filter & Strict Whitelist"""
-    logger.info(f"Checking market news (Morning Batch={is_morning_activation})...")
-    
-    rss_url = (
-        'https://news.google.com/rss/search?'
-        'q=NIFTY+OR+"Bank+Nifty"+OR+NSE+OR+RBI+OR+Reliance+OR+"HDFC+Bank"+OR+"ICICI+Bank"+OR+Infosys+OR+Fed+OR+Crude+when:24h'
-        '&hl=en-IN&gl=IN&ceid=IN:en'
-    )
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    
-    cutoff_time = get_yesterday_4pm_ist()
-    sent_count = 0
+    """Thread-safe, Zero-Duplicate News Scraper with Yesterday 4:00 PM Cutoff"""
+    if not SHARED["lock"].acquire(blocking=False):
+        logger.info("News check skipped: another check is already running.")
+        return
 
     try:
+        logger.info(f"Checking market news (Morning Batch={is_morning_activation})...")
+        rss_url = (
+            'https://news.google.com/rss/search?'
+            'q=("Nifty+options"+OR+"Bank+Nifty"+OR+"India+VIX"+OR+RBI+OR+SEBI+OR+Reliance+OR+"HDFC+Bank"+OR+"ICICI+Bank"+OR+Infosys+OR+TCS+OR+"Crude+Oil"+OR+Brent+OR+"USD+INR"+OR+Rupee+OR+"Gold+price"+OR+Fed+OR+War+OR+Tariff)+when:24h'
+            '&hl=en-IN&gl=IN&ceid=IN:en'
+        )
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        
+        cutoff_time = get_yesterday_4pm_ist()
+        sent_count = 0
+
         resp = requests.get(rss_url, headers=headers, timeout=10)
         feed = feedparser.parse(resp.content)
         
-        # Process oldest to newest since yesterday 4:00 PM
-        entries_list = list(reversed(feed.entries[:40]))
+        entries_list = list(reversed(feed.entries[:50]))
         for entry in entries_list:
-            title_en = entry.title
-            if title_en in seen_news_Global:
+            title_en = entry.title.strip()
+
+            # 1. Duplicate check (Hash + Similar headline across publishers)
+            is_dup, h, wordset = _is_duplicate_news(title_en)
+            if is_dup:
                 continue
-            
+
+            # 2. Parse timestamp & enforce Previous Day 4:00 PM IST cutoff
             try:
                 pub_dt = parsedate_to_datetime(entry.published).astimezone(IST)
                 pub_time_str = pub_dt.strftime("%d-%b %I:%M %p")
@@ -373,57 +572,63 @@ def check_market_news(is_morning_activation=False):
                 pub_dt = datetime.now(IST)
                 pub_time_str = pub_dt.strftime("%d-%b %I:%M %p")
 
-            # Must be after Previous Day 4:00 PM IST
             if pub_dt < cutoff_time:
                 continue
 
-            title_lower = title_en.lower()
-            matched_keywords = [kw.upper() for kw in NEWS_WHITELIST if kw in title_lower]
+            # 3. Strict 6-Point Option Filter & Closing/Opening Blacklist
+            approved, matched_tags = is_high_impact_option_news(title_en)
+            if not approved:
+                continue
+
+            # 4. Translate clean headline (without publisher tail) to Gujarati
+            clean_en = title_en.rsplit(" - ", 1)[0].strip()
+            try:
+                title_gu = GoogleTranslator(source='en', target='gu').translate(clean_en)
+            except Exception:
+                title_gu = clean_en
+
+            tag_str = ", ".join(matched_tags)
+            header_tag = (
+                "🌅 <b>POST-4PM OVERNIGHT MARKET NEWS</b>"
+                if is_morning_activation
+                else "🚨 <b>S'RAVAAL HIGH IMPACT NEWS</b> 🚨"
+            )
+
+            msg_lines = [
+                header_tag,
+                "",
+                f"⏰ <b>News Time:</b> {pub_time_str}",
+                f"🎯 <b>Matched Tag:</b> {tag_str}",
+                "",
+                f"🇮🇳 <b>Gujarati:</b> {title_gu}",
+                "",
+                f"🔤 <b>English:</b> {title_en}",
+                "",
+                "⚡ <b>Action:</b> Nifty 50 Option Radar"
+            ]
+            msg = NL.join(msg_lines)
             
-            if matched_keywords:
-                try:
-                    title_gu = GoogleTranslator(source='auto', target='gu').translate(title_en)
-                except Exception:
-                    title_gu = title_en
+            # Mark as seen BEFORE/ON send & persist to disk so it NEVER sends twice
+            if send_telegram_alert(msg):
+                SHARED["sent_hashes"].add(h)
+                if wordset:
+                    SHARED["sent_wordsets"].append(wordset)
+                _save_disk_cache(SHARED)
+                sent_count += 1
+                time.sleep(0.5)
 
-                tag_str = ", ".join(list(set(matched_keywords))[:3])
-                header_tag = (
-                    "🌅 <b>POST-4PM OVERNIGHT MARKET NEWS</b>"
-                    if is_morning_activation
-                    else "🚨 <b>S'RAVAAL HIGH IMPACT NEWS</b> 🚨"
-                )
-
-                msg_lines = [
-                    header_tag,
-                    "",
-                    f"⏰ <b>News Time:</b> {pub_time_str}",
-                    f"🎯 <b>Matched Tag:</b> {tag_str}",
-                    "",
-                    f"🇮🇳 <b>Gujarati:</b> {title_gu}",
-                    "",
-                    f"🔤 <b>English:</b> {title_en}",
-                    "",
-                    "⚡ <b>Action:</b> Nifty 50 Option Radar"
-                ]
-                msg = NL.join(msg_lines)
+            max_limit = 10 if is_morning_activation else 3
+            if sent_count >= max_limit:
+                break
                 
-                if send_telegram_alert(msg):
-                    seen_news_Global.add(title_en)
-                    sent_count += 1
-                    time.sleep(0.4)
-
-                # On morning wake-up, allow up to 12 overnight news items; running market max 4 per cycle
-                max_limit = 12 if is_morning_activation else 4
-                if sent_count >= max_limit:
-                    break
-                    
-        logger.info(f"News check complete. Sent {sent_count} alerts.")
+        logger.info(f"News check complete. Sent {sent_count} unique alerts.")
     except Exception as e:
         logger.error(f"News Scraper Error: {e}")
+    finally:
+        SHARED["lock"].release()
 
 # =====================================================================
 # [SECTION 5] : MASTER LIVE MARKET DATA ENGINE (TRADINGVIEW + YFINANCE + NSE)
-# Q1, Q2, P3 Fixed: Real-Time Gift Nifty, USD/INR, Global Indices, VIX, PCR & FII
 # =====================================================================
 
 def fetch_tradingview_live_quotes():
@@ -545,7 +750,6 @@ def fetch_live_nse_pcr_and_fii():
     session = requests.Session()
     try:
         session.get("https://www.nseindia.com", headers=headers, timeout=5)
-        # 1. Option Chain for Live Nifty PCR
         oc_resp = session.get("https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY", headers=headers, timeout=6)
         if oc_resp.status_code == 200:
             records = oc_resp.json().get("filtered", {})
@@ -553,7 +757,6 @@ def fetch_live_nse_pcr_and_fii():
             tot_pe = records.get("PE", {}).get("totOI", 0)
             if tot_ce > 0:
                 pcr_val = round(tot_pe / tot_ce, 2)
-        # 2. FII / DII Cash Data
         fii_resp = session.get("https://www.nseindia.com/api/fiidiiTradeReact", headers=headers, timeout=6)
         if fii_resp.status_code == 200:
             for item in fii_resp.json():
@@ -568,11 +771,6 @@ def fetch_live_nse_pcr_and_fii():
     return pcr_val, fii_net, dii_net
 
 def classify_signal(pct_chg, invert=False, flat_threshold=0.10):
-    """
-    Standard Signal Logic:
-    - invert=False: Positive change -> Bullish, Negative -> Bearish
-    - invert=True (for DXY, US10Y, USDINR, Crude, VIX): Rising value is Bearish/Watch for Nifty
-    """
     if abs(pct_chg) <= flat_threshold:
         return "⚪ Neutral"
     if not invert:
@@ -763,7 +961,7 @@ def generate_checklist_data():
         "Signal": dii_sig
     })
 
-    # 17 & 18. FII Derivatives (Futures & Options Trend aligned with live Nifty1! vs Spot)
+    # 17 & 18. FII Derivatives
     fut_bull = (pct_gn >= 0)
     rows.append({
         "Category": "🏦 FII Derivatives",
@@ -780,7 +978,7 @@ def generate_checklist_data():
         "Signal": "🟢 Bullish" if fut_bull else "🔴 Bearish"
     })
 
-    # 19. Nifty PCR (Live from NSE or Dynamic Futures/VIX derived)
+    # 19. Nifty PCR
     if live_pcr is not None:
         pcr_disp = f"{live_pcr:.2f} ({'Bullish' if live_pcr >= 0.95 else ('Bearish' if live_pcr <= 0.80 else 'Neutral')})"
         pcr_sig = "🟢 Bullish" if live_pcr >= 0.95 else ("🔴 Bearish" if live_pcr <= 0.80 else "⚪ Neutral")
@@ -809,7 +1007,7 @@ def generate_checklist_data():
         "Signal": vix_sig
     })
 
-    # 21. Dollar Index (DXY) - Inverted signal (Falling DXY = Bullish for Nifty)
+    # 21. Dollar Index (DXY)
     prev_dxy, stat_dxy, chg_dxy, pct_dxy = get_quote_smart(tv_quotes, ["TVC:DXY"], "DX-Y.NYB", decimals=2)
     rows.append({
         "Category": "📊 Options/Macro",
@@ -819,7 +1017,7 @@ def generate_checklist_data():
         "Signal": classify_signal(pct_dxy, invert=True, flat_threshold=0.05)
     })
 
-    # 22. US 10Y Bond Yield (TVC:US10Y) - Inverted signal
+    # 22. US 10Y Bond Yield (TVC:US10Y)
     prev_us10, stat_us10, chg_us10, pct_us10 = get_quote_smart(tv_quotes, ["TVC:US10Y"], "^TNX", decimals=3, suffix="%")
     rows.append({
         "Category": "📊 Options/Macro",
@@ -829,7 +1027,7 @@ def generate_checklist_data():
         "Signal": classify_signal(pct_us10, invert=True, flat_threshold=0.10)
     })
 
-    # 23. Crude Oil Brent (TVC:UKOIL) - Inverted signal
+    # 23. Crude Oil Brent (TVC:UKOIL)
     prev_oil, stat_oil, chg_oil, pct_oil = get_quote_smart(tv_quotes, ["TVC:UKOIL"], "BZ=F", decimals=2, prefix="$")
     rows.append({
         "Category": "📊 Options/Macro",
@@ -839,7 +1037,7 @@ def generate_checklist_data():
         "Signal": classify_signal(pct_oil, invert=True, flat_threshold=0.15)
     })
 
-    # 24. USD vs INR (FX_IDC:USDINR) - Inverted signal (Rising USDINR = Weak Rupee = Bearish)
+    # 24. USD vs INR (FX_IDC:USDINR)
     prev_inr, stat_inr, chg_inr, pct_inr = get_quote_smart(tv_quotes, ["FX_IDC:USDINR"], "INR=X", decimals=4)
     rows.append({
         "Category": "📊 Options/Macro",
@@ -852,20 +1050,54 @@ def generate_checklist_data():
     return pd.DataFrame(rows)
 
 def check_vix_spike():
-    """Real-time India VIX Spike check (>4% sudden rise alert)"""
-    logger.info("Checking India VIX for sudden spikes...")
+    """
+    ZERO-SPAM India VIX Spike Alert:
+    - Fires ONLY ONCE per milestone per day (4%, 8%, 12%, 16%)
+    - Never repeats the same VIX alert multiple times!
+    """
+    if not SHARED["lock"].acquire(blocking=False):
+        return
     try:
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        if SHARED["vix_date"] != today_str:
+            SHARED["vix_date"] = today_str
+            SHARED["vix_alerted_milestones"] = set()
+            SHARED["last_vix_alert_ts"] = 0.0
+            _save_disk_cache(SHARED)
+
+        # Enforce minimum 30-min cooldown even between distinct milestones
+        if (time.time() - SHARED["last_vix_alert_ts"]) < 1800 and len(SHARED["vix_alerted_milestones"]) > 0:
+            return
+
         tv_q = fetch_tradingview_live_quotes()
         if "NSE:INDIAVIX" in tv_q:
             vix_pct = tv_q["NSE:INDIAVIX"]["pct"]
             vix_val = tv_q["NSE:INDIAVIX"]["close"]
-            if vix_pct >= 4.0:
-                send_telegram_alert(
+
+            # Determine highest crossed milestone (4%, 8%, 12%, 16%)
+            crossed_level = None
+            for lvl in [16, 12, 8, 4]:
+                if vix_pct >= lvl:
+                    crossed_level = lvl
+                    break
+
+            if crossed_level is not None and crossed_level not in SHARED["vix_alerted_milestones"]:
+                sent = send_telegram_alert(
                     f"⚠️ <b>S'RAVAAL VIX SPIKE ALERT:</b> India VIX jumped <b>{vix_pct:+.2f}%</b> "
                     f"(Current: {vix_val:.2f})! Option Premiums expanding fast."
                 )
+                if sent:
+                    # Mark this milestone and all lower milestones as sent for today
+                    for lvl in [4, 8, 12, 16]:
+                        if lvl <= crossed_level:
+                            SHARED["vix_alerted_milestones"].add(lvl)
+                    SHARED["last_vix_alert_ts"] = time.time()
+                    _save_disk_cache(SHARED)
+                    logger.info(f"VIX Alert sent once for +{crossed_level}% level.")
     except Exception as e:
         logger.warning(f"VIX check note: {e}")
+    finally:
+        SHARED["lock"].release()
 
 def calculate_checklist_score(df):
     """Calculates Positive (Bullish) score out of total indicators"""
@@ -907,10 +1139,8 @@ def run_pre_market_checklist():
     send_telegram_alert(msg)
 
 # =====================================================================
-# [SECTION 6] : SAFE SCHEDULER ENGINE (7:30 AM NEWS + 8:50 AM READY)
+# [SECTION 6] : SINGLETON SAFE SCHEDULER (ZERO DUPLICATE THREADS)
 # =====================================================================
-
-AUTO_ENGINE_STATE = {"enabled": True}
 
 def safe_keep_alive():
     if is_working_hours() and AUTO_ENGINE_STATE["enabled"]:
@@ -918,27 +1148,24 @@ def safe_keep_alive():
         logger.info("Keep-Alive Ping: System & Angel One Session Permanent Active.")
 
 def background_tasks():
-    # Permanent Angel Login check & Keep-Alive every 15 mins
+    # Clear any old jobs before registering so duplicate jobs can NEVER accumulate
+    schedule.clear()
+
     schedule.every(15).minutes.do(safe_keep_alive)
     
-    # Morning 7:05 AM Permanent Angel Login
     schedule.every().day.at("07:05").do(
         lambda: ensure_angel_permanent_session() if is_working_hours() and AUTO_ENGINE_STATE["enabled"] else None
     )
-    # Morning 7:30 AM Auto News Activation (Fetches all news since Previous Day 4:00 PM IST)
     schedule.every().day.at("07:30").do(
         lambda: check_market_news(is_morning_activation=True) if is_working_hours() and AUTO_ENGINE_STATE["enabled"] else None
     )
-    # Morning 8:45 AM & 9:08 AM Live Checklist Score Dispatch
     schedule.every().day.at("08:45").do(
         lambda: run_pre_market_checklist() if is_working_hours() and AUTO_ENGINE_STATE["enabled"] else None
     )
     schedule.every().day.at("09:08").do(
         lambda: run_pre_market_checklist() if is_working_hours() and AUTO_ENGINE_STATE["enabled"] else None
     )
-    
-    # Running Market Auto News & VIX (Every 2 & 5 mins)
-    schedule.every(2).minutes.do(
+    schedule.every(3).minutes.do(
         lambda: check_market_news(is_morning_activation=False) if is_working_hours() and AUTO_ENGINE_STATE["enabled"] else None
     )
     schedule.every(5).minutes.do(
@@ -952,11 +1179,12 @@ def background_tasks():
         else:
             time.sleep(60)
 
-if 'thread_started' not in st.session_state:
+# Start ONLY ONE background thread across the ENTIRE Streamlit server
+if not SHARED["scheduler_started"]:
+    SHARED["scheduler_started"] = True
     task_thread = threading.Thread(target=background_tasks, daemon=True)
     task_thread.start()
-    st.session_state.thread_started = True
-    logger.info("Background Scheduler Started Successfully (CPU-Safe Mode)!")
+    logger.info("Singleton Background Scheduler Started (Zero-Duplicate Mode)!")
 
 # =====================================================================
 # [SECTION 7] : SIDEBAR (AUTOMATIC & MANUAL CONTROLS + 3 BUTTONS HERE)
@@ -968,13 +1196,14 @@ if 'system_active_mode' not in st.session_state:
 if 'auto_mode_enabled' not in st.session_state:
     st.session_state.auto_mode_enabled = True
 
-# Automatic Morning Wake-Up: When opened in working hours, auto-login & send Post-4PM news once
+# Automatic Morning Wake-Up: Runs STRICTLY ONCE per day (persisted in SHARED + disk)
 today_date_str = datetime.now(IST).strftime("%Y-%m-%d")
 if st.session_state.system_active_mode and is_working_hours():
     if not ANGEL_SESSION_STATE["is_logged_in"]:
         angel_auto_login(force_relogin=False, notify_telegram=False)
     if ANGEL_SESSION_STATE["morning_news_sent_date"] != today_date_str:
         ANGEL_SESSION_STATE["morning_news_sent_date"] = today_date_str
+        _save_disk_cache(SHARED)
         threading.Thread(target=check_market_news, kwargs={"is_morning_activation": True}, daemon=True).start()
 
 with st.sidebar:
@@ -1007,7 +1236,7 @@ with st.sidebar:
     st.write("")
     if st.button("📰 Fetch Live News (Since Prev 4PM)"):
         check_market_news(is_morning_activation=True)
-        st.toast("✅ Fetched news since yesterday 4:00 PM & sent to Telegram!")
+        st.toast("✅ Checked & sent only NEW unique Option news to Telegram!")
 
     st.write("")
     if st.button("🔐 Test / Refresh Angel Login"):
@@ -1063,11 +1292,12 @@ with t_col3:
     if st.button("🌅 Morning Wake-Up (Activate All + Yesterday 4PM News)"):
         st.session_state.system_active_mode = True
         ANGEL_SESSION_STATE["morning_news_sent_date"] = today_date_str
+        _save_disk_cache(SHARED)
         generate_checklist_data.clear()
         angel_auto_login(force_relogin=True, notify_telegram=True)
         run_pre_market_checklist()
         check_market_news(is_morning_activation=True)
-        st.toast("✅ System Woken Up! Live Checklist & Post-4PM News Sent!")
+        st.toast("✅ System Woken Up! Live Checklist & Unique Post-4PM News Sent!")
 
 st.write("")
 
@@ -1134,7 +1364,7 @@ with col1:
 with col2:
     st.markdown('<div class="box-style">📰 Live Modules Tracking (Nifty 50 Focus)</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="black-bold-box">🕒 News Engine: Auto-Active at 07:30 AM IST (Captures Since Yesterday 04:00 PM IST)</div>',
+        '<div class="black-bold-box">🕒 News Engine: Zero-Duplicate Strict Option Filter (Since Yesterday 04:00 PM IST)</div>',
         unsafe_allow_html=True
     )
     st.markdown(
@@ -1142,7 +1372,7 @@ with col2:
         unsafe_allow_html=True
     )
     st.markdown(
-        f'<div class="black-bold-box">🎯 Strict VIP Filter: {len(NEWS_WHITELIST)} Keywords (Top 10 Stocks, Nifty, BankNifty, IT, Macro)</div>',
+        f'<div class="black-bold-box">🎯 Strict VIP Filter: {len(NEWS_WHITELIST)} Option/Macro Keywords | {len(NEWS_BLACKLIST)} Ignored Noise Rules</div>',
         unsafe_allow_html=True
     )
 
